@@ -75,6 +75,10 @@ transport_connect(const char *host, uint16_t port) {
         fd = -1;
     }
     freeaddrinfo(res);
+    if (fd >= 0) {
+        int n = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &n, sizeof(n));
+    }
     return fd;
 }
 

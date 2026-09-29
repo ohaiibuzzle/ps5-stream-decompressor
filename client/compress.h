@@ -18,15 +18,17 @@ typedef int (*compress_out_fn)(void *user, const void *buf, size_t comp_len,
 
 typedef struct compress_ctx compress_ctx_t;
 
-/* Create a frame-pool encoder.
+/* Create a frame-pool encoder with a decoupled sender thread.
  *
  *   level       zstd compression level
  *   workers     number of worker threads (<=0 means 1)
  *   window_log  zstd windowLog (0 = library default)
  *   chunk_raw   raw bytes per independent frame
+ *   buffer      target bytes of in-flight buffers (bounds memory / read-ahead)
  */
 compress_ctx_t *compress_new(int level, int workers, int window_log,
-                             size_t chunk_raw, compress_out_fn out, void *user);
+                             size_t chunk_raw, size_t buffer,
+                             compress_out_fn out, void *user);
 
 /* Feed up to `len` raw bytes. May block for backpressure while draining
  * completed frames. Returns 0 on success, -1 on error. */
@@ -42,5 +44,8 @@ size_t compress_buffered(const compress_ctx_t *c);
 
 /* Effective number of worker threads (may be capped to bound memory). */
 int compress_workers(const compress_ctx_t *c);
+
+/* Number of in-flight frame slots (the buffer depth). */
+int compress_slots(const compress_ctx_t *c);
 
 #endif /* PS5SD_COMPRESS_H */

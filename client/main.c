@@ -19,6 +19,7 @@
 #include "transport.h"
 
 #define DEFAULT_CHUNK (8u * 1024 * 1024)
+#define DEFAULT_BUFFER (512u * 1024 * 1024)
 #define IO_BUFSIZE    (1u * 1024 * 1024)
 
 enum {
@@ -37,6 +38,7 @@ typedef struct {
     int threads;
     int window_log;
     size_t chunk;
+    size_t buffer;
     uint32_t token;
     int raw;
     int no_passthrough;
@@ -49,7 +51,12 @@ typedef struct {
     int fd;
     uint64_t wire;
     int error;
-} send_ctx_t;typedef struct {
+} send_ctx_t;
+
+#define LOAD_ACQ(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define STORE_ACQ(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
+
+typedef struct {
     int is_member;
     FILE *fp;
     member_reader_t *mr;
@@ -142,10 +149,10 @@ on_frame(void *user, const void *buf, size_t comp_len, size_t raw_len,
     (void)raw_len;
     if (transport_send_frame(c->fd, buf, (uint32_t)comp_len,
                              (uint32_t)raw_len, flags)) {
-        c->error = 1;
+        STORE_ACQ(c->error, 1);
         return -1;
     }
-    c->wire += comp_len;
+    __atomic_add_fetch(&c->wire, comp_len, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -169,6 +176,7 @@ usage(const char *argv0) {
     printf("  -T, --threads N         compress workers, 0 = all cores (default all)\n");
     printf("  -W, --window LOG        zstd window log (default 23)\n");
     printf("  -C, --chunk SIZE        frame size, e.g. 8M, 128M (default 8M)\n");
+    printf("  -B, --buffer SIZE       in-flight buffer budget (default 512M)\n");
     printf("  -t, --token N           shared token\n");
     printf("      --raw               do not compress\n");
     printf("      --no-passthrough    always recompress 7z members\n");
@@ -202,6 +210,7 @@ main(int argc, char **argv) {
         .threads = -1,
         .window_log = 23,
         .chunk = DEFAULT_CHUNK,
+        .buffer = DEFAULT_BUFFER,
     };
     static const struct option longopts[] = {
         { "host", required_argument, 0, 'H' },
@@ -212,6 +221,7 @@ main(int argc, char **argv) {
         { "threads", required_argument, 0, 'T' },
         { "window", required_argument, 0, 'W' },
         { "chunk", required_argument, 0, 'C' },
+        { "buffer", required_argument, 0, 'B' },
         { "token", required_argument, 0, 't' },
         { "raw", no_argument, 0, OPT_RAW },
         { "no-passthrough", no_argument, 0, OPT_NO_PASS },
@@ -239,7 +249,7 @@ main(int argc, char **argv) {
 
     memset(&pass, 0, sizeof(pass));
 
-    while ((c = getopt_long(argc, argv, "H:p:d:m:l:T:W:C:t:yqh", longopts,
+    while ((c = getopt_long(argc, argv, "H:p:d:m:l:T:W:C:B:t:yqh", longopts,
                             NULL)) != -1) {
         switch (c) {
         case OPT_RAW: opt.raw = 1; break;
@@ -259,6 +269,15 @@ main(int argc, char **argv) {
                 return 1;
             }
             opt.chunk = (size_t)sz;
+            break;
+        }
+        case 'B': {
+            uint64_t sz;
+            if (parse_size(optarg, &sz) || sz == 0) {
+                fprintf(stderr, "invalid buffer size: %s\n", optarg);
+                return 1;
+            }
+            opt.buffer = (size_t)sz;
             break;
         }
         case 't': opt.token = (uint32_t)strtoul(optarg, NULL, 0); break;
@@ -534,7 +553,7 @@ main(int argc, char **argv) {
         if (codec == PS5SD_CODEC_ZSTD) {
             compress_ctx_t *enc =
                 compress_new(opt.level, opt.threads, opt.window_log, opt.chunk,
-                             on_frame, &sctx);
+                             opt.buffer, on_frame, &sctx);
             if (!enc) {
                 fprintf(stderr, "cannot create compressor\n");
                 free(buf);
@@ -543,10 +562,11 @@ main(int argc, char **argv) {
                 goto fail;
             }
             if (!opt.quiet) {
-                fprintf(stderr, "pool: %d workers, %zu-byte frames\n",
-                        compress_workers(enc), opt.chunk);
+                fprintf(stderr,
+                        "pool: %d workers, %d slots, %zu-byte frames\n",
+                        compress_workers(enc), compress_slots(enc), opt.chunk);
             }
-            while (done < total && !sctx.error) {
+            while (done < total && !LOAD_ACQ(sctx.error)) {
                 size_t want = total - done < IO_BUFSIZE
                                   ? (size_t)(total - done)
                                   : IO_BUFSIZE;
@@ -572,7 +592,7 @@ main(int argc, char **argv) {
                         char rh[32], th[32], wh[32];
                         human(done, rh, sizeof(rh));
                         human(total, th, sizeof(th));
-                        human(sctx.wire, wh, sizeof(wh));
+                        human(LOAD_ACQ(sctx.wire), wh, sizeof(wh));
                         fprintf(stderr,
                                 "\r  %s / %s raw, %s sent (%.1f%%)   ",
                                 rh, th, wh,
@@ -585,7 +605,7 @@ main(int argc, char **argv) {
                 }
             }
             (void)last_report;
-            if (!sctx.error && compress_finish(enc)) {
+            if (!LOAD_ACQ(sctx.error) && compress_finish(enc)) {
                 fprintf(stderr, "compression error\n");
                 sctx.error = 1;
             }

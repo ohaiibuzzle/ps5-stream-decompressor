@@ -1,4 +1,12 @@
-/* compress.c -- parallel, resumable zstd encoder used by the client. */
+/* compress.c -- parallel, resumable zstd encoder with decoupled output.
+ *
+ * Input is split into independent frames (one per `chunk_raw` bytes). A pool of
+ * worker threads compresses them, and a dedicated sender thread writes
+ * completed frames to the network in order. Decoupling the sender from the
+ * reader/workers means a slow or bursty network no longer stalls compression:
+ * the network is drained continuously while the CPU keeps working, within a
+ * bounded amount of buffered frames.
+ */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -28,7 +36,9 @@ typedef struct {
 } slot_t;
 
 struct compress_ctx {
-    pthread_t *threads;
+    pthread_t *workers;
+    pthread_t sender;
+    int sender_started;
     int nworkers;
     slot_t *slots;
     int nslots;
@@ -42,7 +52,8 @@ struct compress_ctx {
 
     pthread_mutex_t lock;
     pthread_cond_t ready_cv; /* workers wait for READY slots */
-    pthread_cond_t done_cv;  /* main waits on backpressure */
+    pthread_cond_t send_cv;  /* sender waits for DONE frames */
+    pthread_cond_t free_cv;  /* reader waits for a free slot */
     uint64_t next_fill;
     uint64_t next_send;
     int shutdown;
@@ -52,25 +63,30 @@ struct compress_ctx {
     slot_t *cur; /* partial frame being filled (calling thread only) */
 };
 
-/* Send every completed frame that is next in order. Runs without holding the
- * lock except while inspecting/updating slot state. Only the calling thread
- * (compress_write/finish) may call this. */
-static void
-drain(compress_ctx_t *c) {
+/* Emit completed frames in order until none is ready. Runs on the sender
+ * thread only. */
+static void *
+sender_main(void *arg) {
+    compress_ctx_t *c = arg;
+
     for (;;) {
         slot_t *s;
         size_t out_len, raw_len;
         int final, rc;
 
         pthread_mutex_lock(&c->lock);
-        if (c->next_send == c->next_fill) {
-            pthread_mutex_unlock(&c->lock);
-            return;
-        }
-        s = &c->slots[c->next_send % (uint64_t)c->nslots];
-        if (s->state != SLOT_DONE) {
-            pthread_mutex_unlock(&c->lock);
-            return;
+        for (;;) {
+            if (c->error || c->shutdown) {
+                pthread_mutex_unlock(&c->lock);
+                return NULL;
+            }
+            if (c->next_send < c->next_fill) {
+                s = &c->slots[c->next_send % (uint64_t)c->nslots];
+                if (s->state == SLOT_DONE) {
+                    break;
+                }
+            }
+            pthread_cond_wait(&c->send_cv, &c->lock);
         }
         s->state = SLOT_SENDING;
         out_len = s->out_len;
@@ -86,44 +102,40 @@ drain(compress_ctx_t *c) {
         }
         s->state = SLOT_FREE;
         c->next_send++;
-        pthread_cond_broadcast(&c->done_cv);
+        pthread_cond_broadcast(&c->free_cv);
+        pthread_cond_broadcast(&c->send_cv);
         pthread_mutex_unlock(&c->lock);
 
         if (rc) {
-            return;
+            return NULL;
         }
     }
 }
 
-/* Reserve the next slot for filling, waiting (and draining) if the window is
- * full. Returns a FILLING slot with fill == 0, or NULL on error. */
+/* Reserve the next slot for filling, waiting (with backpressure) while the
+ * window is full. Returns a FILLING slot with fill == 0, or NULL on error. */
 static slot_t *
 acquire_slot(compress_ctx_t *c) {
     slot_t *s;
 
-    for (;;) {
-        drain(c);
-
-        pthread_mutex_lock(&c->lock);
-        if (c->error) {
-            pthread_mutex_unlock(&c->lock);
-            return NULL;
-        }
-        if (c->next_fill - c->next_send < (uint64_t)c->nslots) {
-            s = &c->slots[c->next_fill % (uint64_t)c->nslots];
-            s->seq = c->next_fill;
-            s->fill = 0;
-            s->out_len = 0;
-            s->final = 0;
-            s->state = SLOT_FILLING;
-            c->next_fill++;
-            pthread_mutex_unlock(&c->lock);
-            return s;
-        }
-        /* Window full: wait for a worker, then drain again. */
-        pthread_cond_wait(&c->done_cv, &c->lock);
-        pthread_mutex_unlock(&c->lock);
+    pthread_mutex_lock(&c->lock);
+    while (!c->error &&
+           c->next_fill - c->next_send >= (uint64_t)c->nslots) {
+        pthread_cond_wait(&c->free_cv, &c->lock);
     }
+    if (c->error) {
+        pthread_mutex_unlock(&c->lock);
+        return NULL;
+    }
+    s = &c->slots[c->next_fill % (uint64_t)c->nslots];
+    s->seq = c->next_fill;
+    s->fill = 0;
+    s->out_len = 0;
+    s->final = 0;
+    s->state = SLOT_FILLING;
+    c->next_fill++;
+    pthread_mutex_unlock(&c->lock);
+    return s;
 }
 
 static void
@@ -189,21 +201,22 @@ worker_main(void *arg) {
         if (err) {
             c->error = 1;
             pthread_cond_broadcast(&c->ready_cv);
-            pthread_cond_broadcast(&c->done_cv);
+            pthread_cond_broadcast(&c->send_cv);
+            pthread_cond_broadcast(&c->free_cv);
             pthread_mutex_unlock(&c->lock);
             ZSTD_freeCCtx(z);
             return NULL;
         }
         s->out_len = cl;
         s->state = SLOT_DONE;
-        pthread_cond_broadcast(&c->done_cv);
+        pthread_cond_broadcast(&c->send_cv);
         pthread_mutex_unlock(&c->lock);
     }
 }
 
 compress_ctx_t *
 compress_new(int level, int workers, int window_log, size_t chunk_raw,
-             compress_out_fn out, void *user) {
+             size_t buffer_bytes, compress_out_fn out, void *user) {
     compress_ctx_t *c;
 
     if (chunk_raw == 0) {
@@ -218,7 +231,6 @@ compress_new(int level, int workers, int window_log, size_t chunk_raw,
         return NULL;
     }
     c->nworkers = workers;
-    c->nslots = workers + 2;
     c->chunk_raw = chunk_raw;
     c->out_cap = ZSTD_compressBound(chunk_raw);
     c->level = level;
@@ -226,28 +238,25 @@ compress_new(int level, int workers, int window_log, size_t chunk_raw,
     c->out = out;
     c->user = user;
 
-    /* Keep in-flight memory bounded regardless of the requested frame size:
-     * each slot holds an input and an output buffer, so cap the number of
-     * slots (and therefore workers) to a fixed budget. */
+    /* Choose the number of in-flight slots from the buffer budget. Each slot
+     * holds one input and one output buffer, so this bounds memory. Always
+     * keep at least one slot per worker plus headroom. */
     {
-        const uint64_t budget = 2ULL * 1024 * 1024 * 1024; /* 2 GiB */
         uint64_t slot_bytes = (uint64_t)chunk_raw + c->out_cap;
-        int max_slots = slot_bytes ? (int)(budget / slot_bytes) : workers + 2;
+        int slots = slot_bytes ? (int)(buffer_bytes / slot_bytes) : workers + 2;
 
-        if (max_slots < 2) {
-            max_slots = 2;
+        if (slots < workers + 2) {
+            slots = workers + 2;
         }
-        if (c->nslots > max_slots) {
-            c->nslots = max_slots;
+        if (slots > 4096) {
+            slots = 4096;
         }
-        if (c->nworkers > c->nslots) {
-            c->nworkers = c->nslots;
-        }
+        c->nslots = slots;
     }
 
-    c->threads = calloc((size_t)workers, sizeof(pthread_t));
+    c->workers = calloc((size_t)c->nworkers, sizeof(pthread_t));
     c->slots = calloc((size_t)c->nslots, sizeof(slot_t));
-    if (!c->threads || !c->slots) {
+    if (!c->workers || !c->slots) {
         compress_free(c);
         return NULL;
     }
@@ -263,18 +272,31 @@ compress_new(int level, int workers, int window_log, size_t chunk_raw,
 
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->ready_cv, NULL);
-    pthread_cond_init(&c->done_cv, NULL);
+    pthread_cond_init(&c->send_cv, NULL);
+    pthread_cond_init(&c->free_cv, NULL);
     c->inited = 1;
 
-    for (int i = 0; i < workers; i++) {
-        if (pthread_create(&c->threads[i], NULL, worker_main, c) != 0) {
+    if (pthread_create(&c->sender, NULL, sender_main, c) != 0) {
+        compress_free(c);
+        return NULL;
+    }
+    c->sender_started = 1;
+
+    for (int i = 0; i < c->nworkers; i++) {
+        if (pthread_create(&c->workers[i], NULL, worker_main, c) != 0) {
             pthread_mutex_lock(&c->lock);
             c->error = 1;
             c->shutdown = 1;
             pthread_cond_broadcast(&c->ready_cv);
+            pthread_cond_broadcast(&c->send_cv);
+            pthread_cond_broadcast(&c->free_cv);
             pthread_mutex_unlock(&c->lock);
             for (int j = 0; j < i; j++) {
-                pthread_join(c->threads[j], NULL);
+                pthread_join(c->workers[j], NULL);
+            }
+            if (c->sender_started) {
+                pthread_join(c->sender, NULL);
+                c->sender_started = 0;
             }
             c->joined = 1;
             compress_free(c);
@@ -331,28 +353,26 @@ compress_finish(compress_ctx_t *c) {
         submit_slot(c, s);
     }
 
-    for (;;) {
-        int done, err;
-
-        drain(c);
-        pthread_mutex_lock(&c->lock);
-        done = (c->next_send == c->next_fill);
-        err = c->error;
-        if (done || err) {
-            pthread_mutex_unlock(&c->lock);
-            break;
-        }
-        pthread_cond_wait(&c->done_cv, &c->lock);
-        pthread_mutex_unlock(&c->lock);
+    /* Wait for the sender to drain everything. */
+    pthread_mutex_lock(&c->lock);
+    while (!c->error && c->next_send != c->next_fill) {
+        pthread_cond_wait(&c->free_cv, &c->lock);
     }
+    pthread_mutex_unlock(&c->lock);
 
     if (!c->joined) {
         pthread_mutex_lock(&c->lock);
         c->shutdown = 1;
         pthread_cond_broadcast(&c->ready_cv);
+        pthread_cond_broadcast(&c->send_cv);
+        pthread_cond_broadcast(&c->free_cv);
         pthread_mutex_unlock(&c->lock);
         for (int i = 0; i < c->nworkers; i++) {
-            pthread_join(c->threads[i], NULL);
+            pthread_join(c->workers[i], NULL);
+        }
+        if (c->sender_started) {
+            pthread_join(c->sender, NULL);
+            c->sender_started = 0;
         }
         c->joined = 1;
     }
@@ -369,18 +389,29 @@ compress_workers(const compress_ctx_t *c) {
     return c->nworkers;
 }
 
+int
+compress_slots(const compress_ctx_t *c) {
+    return c->nslots;
+}
+
 void
 compress_free(compress_ctx_t *c) {
     if (!c) {
         return;
     }
-    if (!c->joined && c->inited && c->threads && c->slots) {
+    if (!c->joined && c->inited && c->slots) {
         pthread_mutex_lock(&c->lock);
         c->shutdown = 1;
         pthread_cond_broadcast(&c->ready_cv);
+        pthread_cond_broadcast(&c->send_cv);
+        pthread_cond_broadcast(&c->free_cv);
         pthread_mutex_unlock(&c->lock);
         for (int i = 0; i < c->nworkers; i++) {
-            pthread_join(c->threads[i], NULL);
+            pthread_join(c->workers[i], NULL);
+        }
+        if (c->sender_started) {
+            pthread_join(c->sender, NULL);
+            c->sender_started = 0;
         }
         c->joined = 1;
     }
@@ -391,11 +422,12 @@ compress_free(compress_ctx_t *c) {
         }
     }
     free(c->slots);
-    free(c->threads);
+    free(c->workers);
     if (c->inited) {
         pthread_mutex_destroy(&c->lock);
         pthread_cond_destroy(&c->ready_cv);
-        pthread_cond_destroy(&c->done_cv);
+        pthread_cond_destroy(&c->send_cv);
+        pthread_cond_destroy(&c->free_cv);
     }
     free(c);
 }
