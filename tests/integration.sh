@@ -86,6 +86,7 @@ expect_ok() {
 
 info "== basic paths =="
 expect_ok "plain zstd"        "$SRC/plain.bin" -- "$SRC/plain.bin"
+expect_ok "plain zstd pool"   "$SRC/plain.bin" -- -T 4 -C 1048576 "$SRC/plain.bin"
 expect_ok "plain raw"         "$SRC/plain.bin" -- --raw "$SRC/plain.bin"
 expect_ok "empty zstd"        "$SRC/empty.bin" -- "$SRC/empty.bin"
 expect_ok "empty raw"         "$SRC/empty.bin" -- --raw "$SRC/empty.bin"

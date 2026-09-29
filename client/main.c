@@ -16,7 +16,7 @@
 #include "sevenzip.h"
 #include "transport.h"
 
-#define DEFAULT_CHUNK (16u * 1024 * 1024)
+#define DEFAULT_CHUNK (8u * 1024 * 1024)
 #define IO_BUFSIZE    (1u * 1024 * 1024)
 
 enum {
@@ -125,9 +125,9 @@ usage(const char *argv0) {
     printf("  -d, --dest NAME         destination filename\n");
     printf("  -m, --member PATH       member to extract from the archive\n");
     printf("  -l, --level N           zstd level (default 19)\n");
-    printf("  -T, --threads N         zstd threads, 0 = all cores (default all)\n");
-    printf("  -W, --window LOG        zstd window log (default 24)\n");
-    printf("  -C, --chunk BYTES       frame size in bytes (default 16 MiB)\n");
+    printf("  -T, --threads N         compress workers, 0 = all cores (default all)\n");
+    printf("  -W, --window LOG        zstd window log (default 23)\n");
+    printf("  -C, --chunk BYTES       frame size in bytes (default 8 MiB)\n");
     printf("  -t, --token N           shared token\n");
     printf("      --raw               do not compress\n");
     printf("      --no-passthrough    always recompress 7z members\n");
@@ -159,7 +159,7 @@ main(int argc, char **argv) {
         .port = PS5SD_DEFAULT_PORT,
         .level = 19,
         .threads = -1,
-        .window_log = 24,
+        .window_log = 23,
         .chunk = DEFAULT_CHUNK,
     };
     static const struct option longopts[] = {
@@ -226,7 +226,7 @@ main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-    if (opt.threads < 0) {
+    if (opt.threads <= 0) {
         long n = sysconf(_SC_NPROCESSORS_ONLN);
         opt.threads = n > 0 ? (int)n : 1;
     }

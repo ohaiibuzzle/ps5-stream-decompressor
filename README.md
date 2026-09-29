@@ -141,12 +141,37 @@ ps5streamd.elf [-p PORT] [-d DIR] [-t TOKEN] [-q]
 
 Run `./client/ps5push --help` for all options.
 
-### Tuning
+### Tuning and parallelism
 
-`zstd` level, window log, and frame size are configurable. Larger frames improve
-the ratio slightly but make resume granularity coarser. For an already
-LZMA2-compressed `.7z`, pass-through is used regardless of these settings and no
-recompression happens at all.
+The zstd path splits the input into independent frames (default 8 MiB, `-C`)
+and compresses them with a pool of worker threads (`-T`, default all cores).
+Because the frames are independent, this is embarrassingly parallel — measured
+~3× faster than a single-threaded encoder at level 19, and it scales across
+physical cores. Independent frames also mean the same stream can be resumed at
+any frame boundary.
+
+`zstd` level (`-l`), window log (`-W`) and frame size are configurable. Larger
+frames improve the ratio marginally; smaller frames give finer resume
+granularity and lower memory. Lower levels are dramatically faster (see below).
+
+For an already LZMA2-compressed `.7z`, pass-through is used regardless of these
+settings and no recompression happens at all.
+
+### Measured performance
+
+On a 16-thread machine, streaming a 330 MiB disk-image-like file over loopback:
+
+| Path | Throughput |
+|---|---|
+| zstd level 19, 1 worker | ~46 MiB/s |
+| zstd level 19, frame pool | ~150 MiB/s |
+| zstd level 12, frame pool | ~745 MiB/s |
+| raw (no compression) pipeline ceiling | ~1.2 GiB/s |
+| 7z LZMA2 pass-through (no client CPU) | ~490 MiB/s |
+
+The server decodes zstd at well over 1 GiB/s and LZMA2 at several hundred MiB/s,
+so the server is network-bound and does not need a decoder pool. LZMA2
+pass-through is a single continuous stream and is inherently serial anyway.
 
 ## Testing
 
