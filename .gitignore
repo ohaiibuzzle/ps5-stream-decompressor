@@ -1,0 +1,30 @@
+# --- Build artifacts ---------------------------------------------------------
+*.o
+*.a
+*.so
+*.elf
+build/
+*.d
+
+# --- Binaries -----------------------------------------------------------------
+/client/ps5push
+/server/server-native
+/server/ps5streamd.elf
+
+# --- Test / runtime scratch ---------------------------------------------------
+/tests/tmp/
+*.log
+core
+core.*
+
+# --- Editor / OS noise --------------------------------------------------------
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+compile_commands.json
+
+# Vendored sources under third_party/ are intentionally tracked; only their
+# build output is ignored (covered by the rules above).
