@@ -130,6 +130,7 @@ ps5streamd.elf [-p PORT] [-d DIR] [-t TOKEN] [-q]
 
 # Faster / smaller trade-offs
 ./client/ps5push -H 192.168.1.50 -l 9 -T 8 disk.img
+./client/ps5push -H 192.168.1.50 -C 128M disk.img      # larger frames
 ./client/ps5push -H 192.168.1.50 --raw already-compressed.bin
 
 # Resume an interrupted zstd transfer
@@ -150,9 +151,18 @@ Because the frames are independent, this is embarrassingly parallel — measured
 physical cores. Independent frames also mean the same stream can be resumed at
 any frame boundary.
 
-`zstd` level (`-l`), window log (`-W`) and frame size are configurable. Larger
-frames improve the ratio marginally; smaller frames give finer resume
-granularity and lower memory. Lower levels are dramatically faster (see below).
+`zstd` level (`-l`), window log (`-W`) and frame size (`-C`, e.g. `8M`, `128M`,
+`1G`) are configurable. Larger frames improve the ratio (fewer independent
+frames reset the dictionary); smaller frames give finer resume granularity and
+lower memory. Lower levels are dramatically faster (see below).
+
+Choose a frame size that leaves plenty of frames to go around: ideally
+`file_size / chunk` should be several times the worker count, otherwise some
+workers idle at the tail. For multi-GiB images, `64M`–`256M` is a good range.
+
+The pool never uses more than ~2 GiB of in-flight buffers: when a large frame
+size would exceed that, the number of worker threads is reduced automatically
+(the effective count is printed as `pool: N workers`).
 
 For an already LZMA2-compressed `.7z`, pass-through is used regardless of these
 settings and no recompression happens at all.

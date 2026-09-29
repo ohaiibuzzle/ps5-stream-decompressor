@@ -86,7 +86,7 @@ expect_ok() {
 
 info "== basic paths =="
 expect_ok "plain zstd"        "$SRC/plain.bin" -- "$SRC/plain.bin"
-expect_ok "plain zstd pool"   "$SRC/plain.bin" -- -T 4 -C 1048576 "$SRC/plain.bin"
+expect_ok "plain zstd pool"   "$SRC/plain.bin" -- -T 4 -C 1M "$SRC/plain.bin"
 expect_ok "plain raw"         "$SRC/plain.bin" -- --raw "$SRC/plain.bin"
 expect_ok "empty zstd"        "$SRC/empty.bin" -- "$SRC/empty.bin"
 expect_ok "empty raw"         "$SRC/empty.bin" -- --raw "$SRC/empty.bin"
@@ -183,11 +183,11 @@ info "== resume =="
 if command -v truncate >/dev/null 2>&1; then
     rm -f "$OUT/out.bin"
     start_server
-    "$CLIENT" -q -H 127.0.0.1 -p "$PORT" -d out.bin -C 1048576 "$SRC/plain.bin" >/dev/null 2>&1
+    "$CLIENT" -q -H 127.0.0.1 -p "$PORT" -d out.bin -C 1M "$SRC/plain.bin" >/dev/null 2>&1
     stop_server
     truncate -s 7340032 "$OUT/out.bin"
     start_server
-    if "$CLIENT" -q -H 127.0.0.1 -p "$PORT" -d out.bin -C 1048576 --resume "$SRC/plain.bin" >/dev/null 2>&1 \
+    if "$CLIENT" -q -H 127.0.0.1 -p "$PORT" -d out.bin -C 1M --resume "$SRC/plain.bin" >/dev/null 2>&1 \
        && cmp -s "$SRC/plain.bin" "$OUT/out.bin"; then
         ok "resume zstd"
     else

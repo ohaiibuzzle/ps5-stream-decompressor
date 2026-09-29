@@ -226,6 +226,25 @@ compress_new(int level, int workers, int window_log, size_t chunk_raw,
     c->out = out;
     c->user = user;
 
+    /* Keep in-flight memory bounded regardless of the requested frame size:
+     * each slot holds an input and an output buffer, so cap the number of
+     * slots (and therefore workers) to a fixed budget. */
+    {
+        const uint64_t budget = 2ULL * 1024 * 1024 * 1024; /* 2 GiB */
+        uint64_t slot_bytes = (uint64_t)chunk_raw + c->out_cap;
+        int max_slots = slot_bytes ? (int)(budget / slot_bytes) : workers + 2;
+
+        if (max_slots < 2) {
+            max_slots = 2;
+        }
+        if (c->nslots > max_slots) {
+            c->nslots = max_slots;
+        }
+        if (c->nworkers > c->nslots) {
+            c->nworkers = c->nslots;
+        }
+    }
+
     c->threads = calloc((size_t)workers, sizeof(pthread_t));
     c->slots = calloc((size_t)c->nslots, sizeof(slot_t));
     if (!c->threads || !c->slots) {
@@ -343,6 +362,11 @@ compress_finish(compress_ctx_t *c) {
 size_t
 compress_buffered(const compress_ctx_t *c) {
     return c->cur ? c->cur->fill : 0;
+}
+
+int
+compress_workers(const compress_ctx_t *c) {
+    return c->nworkers;
 }
 
 void

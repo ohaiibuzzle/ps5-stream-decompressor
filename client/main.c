@@ -1,9 +1,11 @@
 /* main.c -- ps5push: stream a file (or a single archive member) to the PS5. */
 #define _FILE_OFFSET_BITS 64
 
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +64,45 @@ path_basename(const char *p) {
     if (slash) b = slash + 1;
     if (bslash && bslash + 1 > b) b = bslash + 1;
     return b;
+}
+
+/* Parse a size such as "8M", "128M", "1G", "512k", "2MiB" or plain bytes.
+ * Single-letter and *B suffixes are powers of 1024 (M == MiB). */
+static int
+parse_size(const char *s, uint64_t *out) {
+    char *end;
+    double v;
+    double mult = 1.0;
+
+    if (!s || !*s) {
+        return -1;
+    }
+    errno = 0;
+    v = strtod(s, &end);
+    if (end == s || errno || v < 0) {
+        return -1;
+    }
+    if (*end) {
+        switch (tolower((unsigned char)*end)) {
+        case 'k': mult = 1024.0; break;
+        case 'm': mult = 1024.0 * 1024.0; break;
+        case 'g': mult = 1024.0 * 1024.0 * 1024.0; break;
+        case 't': mult = 1024.0 * 1024.0 * 1024.0 * 1024.0; break;
+        case 'b': mult = 1.0; break;
+        default: return -1;
+        }
+        end++;
+        if (*end == 'i' || *end == 'I') end++;
+        if (*end == 'b' || *end == 'B') end++;
+    }
+    if (*end) {
+        return -1;
+    }
+    if (v * mult > (double)UINT64_MAX) {
+        return -1;
+    }
+    *out = (uint64_t)(v * mult);
+    return 0;
 }
 
 static void
@@ -127,7 +168,7 @@ usage(const char *argv0) {
     printf("  -l, --level N           zstd level (default 19)\n");
     printf("  -T, --threads N         compress workers, 0 = all cores (default all)\n");
     printf("  -W, --window LOG        zstd window log (default 23)\n");
-    printf("  -C, --chunk BYTES       frame size in bytes (default 8 MiB)\n");
+    printf("  -C, --chunk SIZE        frame size, e.g. 8M, 128M (default 8M)\n");
     printf("  -t, --token N           shared token\n");
     printf("      --raw               do not compress\n");
     printf("      --no-passthrough    always recompress 7z members\n");
@@ -211,7 +252,15 @@ main(int argc, char **argv) {
         case 'l': opt.level = atoi(optarg); break;
         case 'T': opt.threads = atoi(optarg); break;
         case 'W': opt.window_log = atoi(optarg); break;
-        case 'C': opt.chunk = (size_t)strtoull(optarg, NULL, 0); break;
+        case 'C': {
+            uint64_t sz;
+            if (parse_size(optarg, &sz) || sz == 0 || sz > (1ULL << 31)) {
+                fprintf(stderr, "invalid chunk size: %s\n", optarg);
+                return 1;
+            }
+            opt.chunk = (size_t)sz;
+            break;
+        }
         case 't': opt.token = (uint32_t)strtoul(optarg, NULL, 0); break;
         case 'y': opt.yes = 1; break;
         case 'q': opt.quiet = 1; break;
@@ -373,8 +422,7 @@ main(int argc, char **argv) {
                     codec == PS5SD_CODEC_LZMA2 ? "LZMA2" : "LZMA1",
                     (unsigned long long)pass.pack_size);
         } else if (codec == PS5SD_CODEC_ZSTD) {
-            fprintf(stderr, "recompressing with zstd level %d (%d threads)\n",
-                    opt.level, opt.threads);
+            fprintf(stderr, "recompressing with zstd level %d\n", opt.level);
         } else {
             fprintf(stderr, "sending uncompressed\n");
         }
@@ -493,6 +541,10 @@ main(int argc, char **argv) {
                 send_abort(fd);
                 close(fd);
                 goto fail;
+            }
+            if (!opt.quiet) {
+                fprintf(stderr, "pool: %d workers, %zu-byte frames\n",
+                        compress_workers(enc), opt.chunk);
             }
             while (done < total && !sctx.error) {
                 size_t want = total - done < IO_BUFSIZE

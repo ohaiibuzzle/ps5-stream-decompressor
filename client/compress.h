@@ -40,4 +40,7 @@ void compress_free(compress_ctx_t *c);
 /* Size currently buffered in the partial frame. */
 size_t compress_buffered(const compress_ctx_t *c);
 
+/* Effective number of worker threads (may be capped to bound memory). */
+int compress_workers(const compress_ctx_t *c);
+
 #endif /* PS5SD_COMPRESS_H */
